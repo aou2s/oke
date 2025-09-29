@@ -1,8 +1,11 @@
 import discord
 from discord import app_commands
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
+import time
+from flask import Flask
+from threading import Thread
 
 # Load tokens from environment variables
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
@@ -14,18 +17,84 @@ if not DISCORD_TOKEN:
 if not TFL_APP_KEY:
     raise ValueError("TFL_APP_KEY environment variable is not set")
 
+# Create Flask app for keep-alive
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot is alive!", 200
+
+@app.route('/health')
+def health():
+    uptime_seconds = int(time.time() - start_time) if start_time else 0
+    return {
+        "status": "online",
+        "uptime_seconds": uptime_seconds
+    }, 200
+
+def run_flask():
+    app.run(host='0.0.0.0', port=8080)
+
+def keep_alive():
+    thread = Thread(target=run_flask)
+    thread.daemon = True
+    thread.start()
+
 # Set up the bot with necessary intents
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
+# Track when the bot started
+start_time = None
+
 @client.event
 async def on_ready():
     """Event handler for when the bot is ready."""
+    global start_time
+    start_time = time.time()
     await tree.sync()
     if client.user:
         print(f'Logged in as {client.user} (ID: {client.user.id})')
         print('------')
+
+@tree.command(name="ping", description="Check the bot's latency and uptime")
+async def ping(interaction: discord.Interaction):
+    """
+    Slash command to check bot latency and uptime.
+    """
+    # Calculate latency
+    latency = round(client.latency * 1000)
+    
+    # Calculate uptime
+    if start_time:
+        uptime_seconds = int(time.time() - start_time)
+        uptime_delta = timedelta(seconds=uptime_seconds)
+        
+        # Format uptime nicely
+        days = uptime_delta.days
+        hours, remainder = divmod(uptime_delta.seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        
+        if days > 0:
+            uptime_str = f"{days}d {hours}h {minutes}m {seconds}s"
+        elif hours > 0:
+            uptime_str = f"{hours}h {minutes}m {seconds}s"
+        elif minutes > 0:
+            uptime_str = f"{minutes}m {seconds}s"
+        else:
+            uptime_str = f"{seconds}s"
+    else:
+        uptime_str = "Unknown"
+    
+    embed = discord.Embed(
+        title="🏓 Pong!",
+        color=0xffb7c5
+    )
+    embed.add_field(name="Latency", value=f"{latency}ms", inline=True)
+    embed.add_field(name="Uptime", value=uptime_str, inline=True)
+    
+    await interaction.response.send_message(embed=embed)
 
 @tree.command(name="route", description="Get bus registration plates for a specific TFL route.")
 async def route(interaction: discord.Interaction, route_number: str):
@@ -260,6 +329,9 @@ async def vehicle(interaction: discord.Interaction, registration: str):
     except Exception as e:
         print(f"An error occurred: {e}")
         await interaction.followup.send("Sorry, an unexpected error occurred while fetching the vehicle data.")
+
+# Start the keep-alive server
+keep_alive()
 
 # Run the bot
 client.run(DISCORD_TOKEN)
