@@ -65,17 +65,17 @@ async def ping(interaction: discord.Interaction):
     """
     # Calculate latency
     latency = round(client.latency * 1000)
-    
+
     # Calculate uptime
     if start_time:
         uptime_seconds = int(time.time() - start_time)
         uptime_delta = timedelta(seconds=uptime_seconds)
-        
+
         # Format uptime nicely
         days = uptime_delta.days
         hours, remainder = divmod(uptime_delta.seconds, 3600)
         minutes, seconds = divmod(remainder, 60)
-        
+
         if days > 0:
             uptime_str = f"{days}d {hours}h {minutes}m {seconds}s"
         elif hours > 0:
@@ -86,26 +86,56 @@ async def ping(interaction: discord.Interaction):
             uptime_str = f"{seconds}s"
     else:
         uptime_str = "Unknown"
-    
+
     embed = discord.Embed(
         title="🏓 Pong!",
         color=0xffb7c5
     )
     embed.add_field(name="Latency", value=f"{latency}ms", inline=True)
     embed.add_field(name="Uptime", value=uptime_str, inline=True)
-    
+
     await interaction.response.send_message(embed=embed)
 
-@tree.command(name="route", description="Get bus registration plates for a specific TFL route.")
+@tree.command(name="route", description="Get bus registration plates for TFL routes (separate multiple with commas)")
 async def route(interaction: discord.Interaction, route_number: str):
     """
-    Slash command to fetch and display bus registration plates for a given route.
+    Slash command to fetch and display bus registration plates for given routes.
     Args:
         interaction: The interaction object from Discord.
-        route_number: The bus route number to query.
+        route_number: The bus route number(s) to query (comma-separated for multiple).
     """
     await interaction.response.defer()
 
+    # Split route numbers by comma and clean whitespace
+    route_numbers = [r.strip() for r in route_number.split(',') if r.strip()]
+
+    if not route_numbers:
+        await interaction.followup.send("Please provide at least one valid route number.")
+        return
+
+    # Collect all embeds
+    embeds = []
+
+    # Process each route
+    for single_route in route_numbers:
+        embed = await process_single_route(single_route)
+        if embed:
+            embeds.append(embed)
+
+    # Send all embeds in one message (Discord allows up to 10 embeds per message)
+    if embeds:
+        await interaction.followup.send(embeds=embeds[:10])  # Limit to 10 embeds
+    else:
+        await interaction.followup.send("Could not retrieve information for any of the requested routes.")
+
+async def process_single_route(route_number: str):
+    """
+    Process a single route and return its embed.
+    Args:
+        route_number: The bus route number to query.
+    Returns:
+        A discord.Embed object or None if there was an error.
+    """
     # Construct the TFL API URL - using Arrivals endpoint to get vehicle data
     url = f"https://api.tfl.gov.uk/Line/{route_number}/Arrivals"
     params = {'app_key': TFL_APP_KEY}
@@ -119,34 +149,62 @@ async def route(interaction: discord.Interaction, route_number: str):
         data = response.json()
 
         if not data:
-            await interaction.followup.send(f"No active buses found for route **{route_number}**. It might be an invalid route or there's no service at the moment.")
-            return
+            return None
 
         # Extract vehicle registration plates and destinations from arrivals data
+        # Store all arrivals for each vehicle to find the soonest one
         bus_info = {}
         for arrival in data:
             vehicle_id = arrival.get('vehicleId')
             destination = arrival.get('destinationName', 'Unknown Destination')
             station_name = arrival.get('stationName', 'Unknown Stop')
-            expected_arrival = arrival.get('expectedArrival', 'N/A')
 
-            # Convert ISO timestamp to readable time if available
+            # Try to use timeToStation (in seconds) first as it's more accurate
+            time_to_station = arrival.get('timeToStation')
+
+            # Calculate Unix timestamp based on current time + timeToStation
             time_due = "N/A"
-            if expected_arrival != 'N/A':
+            arrival_timestamp = None
+
+            if time_to_station is not None:
                 try:
-                    dt = datetime.fromisoformat(expected_arrival.replace('Z', '+00:00'))
-                    time_due = dt.strftime('%H:%M')
-                except Exception:
+                    # Current time + seconds until arrival
+                    arrival_timestamp = int(time.time()) + time_to_station
+                    time_due = f"<t:{arrival_timestamp}:R>"
+                except Exception as e:
+                    print(f"Error calculating timestamp for {vehicle_id}: {e}")
                     time_due = "N/A"
+            else:
+                # Fallback to expectedArrival if timeToStation not available
+                expected_arrival = arrival.get('expectedArrival')
+                if expected_arrival:
+                    try:
+                        dt = datetime.fromisoformat(expected_arrival.replace('Z', '+00:00'))
+                        arrival_timestamp = int(dt.timestamp())
+                        time_due = f"<t:{arrival_timestamp}:R>"
+                    except Exception as e:
+                        print(f"Error parsing timestamp for {vehicle_id}: {e}")
+                        time_due = "N/A"
 
             if vehicle_id and vehicle_id != 'N/A':
-                # Store the first arrival info for each vehicle
+                # Only keep the soonest arrival for each vehicle
                 if vehicle_id not in bus_info:
                     bus_info[vehicle_id] = {
                         'destination': destination,
                         'next_stop': station_name,
-                        'time_due': time_due
+                        'time_due': time_due,
+                        'timestamp': arrival_timestamp
                     }
+                else:
+                    # Update if this arrival is sooner
+                    if arrival_timestamp is not None and bus_info[vehicle_id]['timestamp'] is not None:
+                        if arrival_timestamp < bus_info[vehicle_id]['timestamp']:
+                            bus_info[vehicle_id] = {
+                                'destination': destination,
+                                'next_stop': station_name,
+                                'time_due': time_due,
+                                'timestamp': arrival_timestamp
+                            }
 
         # Fetch fleet codes from bustimes.org API for each vehicle
         bus_data = []
@@ -171,8 +229,7 @@ async def route(interaction: discord.Interaction, route_number: str):
         sorted_buses = sorted(bus_data)
 
         if not sorted_buses:
-            await interaction.followup.send(f"Could not find any active buses for route **{route_number}**. The route may not exist or there may be no active service.")
-            return
+            return None
 
         # Format the response as an embed with single column
         embed = discord.Embed(
@@ -182,8 +239,8 @@ async def route(interaction: discord.Interaction, route_number: str):
 
         # Create single column format: Fleet Code - Registration towards Destination due Time at Stop
         bus_lines = []
-        for reg, dest, fleet, stop, time in sorted_buses:
-            line = f"{fleet} - {reg} towards {dest} due {time} at {stop}"
+        for reg, dest, fleet, stop, time_str in sorted_buses:
+            line = f"{fleet} - {reg} towards {dest} due {time_str} at {stop}"
             bus_lines.append(line)
 
         # Join all lines with newlines for single column display
@@ -192,16 +249,14 @@ async def route(interaction: discord.Interaction, route_number: str):
         # Add as a single field with no inline (takes full width)
         embed.add_field(name="Vehicle Info", value=bus_info_text, inline=False)
 
-        await interaction.followup.send(embed=embed)
+        return embed
 
     except requests.exceptions.HTTPError as http_err:
-        if response and response.status_code == 404:
-            await interaction.followup.send(f"Route **{route_number}** could not be found. Please check the route number and try again.")
-        else:
-            await interaction.followup.send(f"An HTTP error occurred: {http_err}")
+        print(f"HTTP error for route {route_number}: {http_err}")
+        return None
     except Exception as e:
-        print(f"An error occurred: {e}")
-        await interaction.followup.send("Sorry, an unexpected error occurred while fetching the bus data.")
+        print(f"An error occurred for route {route_number}: {e}")
+        return None
 
 async def vehicle_autocomplete(
     interaction: discord.Interaction,
